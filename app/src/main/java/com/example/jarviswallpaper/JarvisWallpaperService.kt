@@ -8,7 +8,7 @@ import android.net.Uri
 import android.os.*
 import kotlin.math.*
 
-private data class MatrixMatrixDot(
+private data class MatrixDot(
     val x: Float, val y: Float, val alpha: Int,
     val red: Int, val green: Int, val blue: Int
 )
