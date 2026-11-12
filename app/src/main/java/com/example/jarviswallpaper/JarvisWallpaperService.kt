@@ -8,14 +8,15 @@ import android.net.Uri
 import android.os.*
 import kotlin.math.*
 
+private data class MatrixMatrixDot(
+    val x: Float, val y: Float, val alpha: Int,
+    val red: Int, val green: Int, val blue: Int
+)
+
 class JarvisWallpaperService : WallpaperService() {
     override fun onCreateEngine(): Engine = MatrixEngine()
 
     inner class MatrixEngine : Engine() {
-        private data class Dot(
-            val x: Float, val y: Float, val alpha: Int,
-            val red: Int, val green: Int, val blue: Int
-        )
 
         private val handler = Handler(Looper.getMainLooper())
         private var visible = false
@@ -24,7 +25,7 @@ class JarvisWallpaperService : WallpaperService() {
         private var videoMode = false
         private var bitmap: Bitmap? = null
         private var loadedUri: String? = null
-        private var dots: List<Dot> = emptyList()
+        private var dots: List<MatrixDot> = emptyList()
         private var cachedWidth = 0
         private var cachedHeight = 0
         private val prefs by lazy {
@@ -152,7 +153,7 @@ class JarvisWallpaperService : WallpaperService() {
             val drawnH = image.height * scale
             val left = (width - drawnW) / 2f
             val top = (height - drawnH) / 2f
-            val result = ArrayList<Dot>()
+            val result = ArrayList<MatrixDot>()
 
             var y = spacing / 2f
             while (y < height) {
@@ -172,7 +173,7 @@ class JarvisWallpaperService : WallpaperService() {
                                 .toInt().coerceIn(25, 250)
                             // Purple-white highlights with a subtle cyan contribution.
                             result.add(
-                                Dot(
+                                MatrixDot(
                                     x, y, strength,
                                     (r * 0.72f + 190 * 0.28f).toInt().coerceIn(0,255),
                                     (g * 0.55f + 145 * 0.45f).toInt().coerceIn(0,255),
