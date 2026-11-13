@@ -1,4 +1,3 @@
-\
 package com.example.jarviswallpaper
 
 import android.service.wallpaper.WallpaperService
