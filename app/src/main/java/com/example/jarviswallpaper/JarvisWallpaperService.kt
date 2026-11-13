@@ -1,12 +1,19 @@
 package com.example.jarviswallpaper
 
-import android.service.wallpaper.WallpaperService
-import android.view.SurfaceHolder
-import android.graphics.*
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
 import android.media.MediaMetadataRetriever
 import android.net.Uri
-import android.os.*
-import kotlin.math.*
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.Looper
+import android.service.wallpaper.WallpaperService
+import android.view.SurfaceHolder
+import kotlin.math.max
+import kotlin.math.min
 
 private data class MatrixDot(
     val x: Float, val y: Float, val alpha: Int,
@@ -17,166 +24,128 @@ class JarvisWallpaperService : WallpaperService() {
     override fun onCreateEngine(): Engine = MatrixEngine()
 
     inner class MatrixEngine : Engine() {
-        private val drawHandler = Handler(Looper.getMainLooper())
-        private var videoThread: HandlerThread? = null
-        private var videoHandler: Handler? = null
-        private var retriever: MediaMetadataRetriever? = null
-        private var videoDurationUs = 0L
-        private var videoPositionUs = 0L
+        private val main = Handler(Looper.getMainLooper())
+        private val prefs by lazy { getSharedPreferences("jarvis_wallpaper", MODE_PRIVATE) }
         private var visible = false
-        private var pulseFrame = 0
-        private var bitmap: Bitmap? = null
-        private var loadedUri: String? = null
+        private var surfaceWidth = 0
+        private var surfaceHeight = 0
+        private var grid = emptyList<Pair<Float, Float>>()
         @Volatile private var dots: List<MatrixDot> = emptyList()
-        @Volatile private var gridPositions: List<Pair<Float, Float>> = emptyList()
-        private var cachedWidth = 0
-        private var cachedHeight = 0
+        private var imageUri: String? = null
         private var videoUri: String? = null
-        private val prefs by lazy {
-            getSharedPreferences("jarvis_wallpaper", MODE_PRIVATE)
-        }
+        private var decoderThread: HandlerThread? = null
+        private var decoderHandler: Handler? = null
+        private var retriever: MediaMetadataRetriever? = null
+        private var durationUs = 0L
+        private var positionUs = 0L
+        private var decoding = false
+        private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
 
-        private val drawTask = object : Runnable {
-            override fun run() {
-                if (!visible) return
-                drawFrame()
-                val power = getSystemService(POWER_SERVICE) as PowerManager
-                val saver = power.isPowerSaveMode
-                val thermal = if (Build.VERSION.SDK_INT >= 29)
-                    power.currentThermalStatus else 0
-                val delay = when {
-                    saver || thermal >= 3 -> 100L
-                    thermal >= 2 -> 66L
-                    else -> 33L
-                }
-                drawHandler.postDelayed(this, delay)
-            }
-        }
-
-        override fun onVisibilityChanged(visibleNow: Boolean) {
-            visible = visibleNow
-            drawHandler.removeCallbacks(drawTask)
-            if (visible) {
-                loadSelectedMedia()
-                drawHandler.post(drawTask)
+        override fun onVisibilityChanged(isVisible: Boolean) {
+            visible = isVisible
+            if (!visible) {
+                stopVideo()
             } else {
-                stopVideoProcessing()
-                bitmap?.recycle()
-                bitmap = null
-                dots = emptyList()
-                loadedUri = null
+                loadSelectedMedia()
             }
         }
 
         override fun onSurfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
             super.onSurfaceChanged(holder, format, width, height)
-            cachedWidth = 0
-            gridPositions = emptyList()
-            dots = emptyList()
-            if (visible) {
-                loadSelectedMedia()
-                drawFrame()
-            }
+            surfaceWidth = width
+            surfaceHeight = height
+            buildGrid()
+            loadSelectedMedia()
         }
 
         override fun onSurfaceDestroyed(holder: SurfaceHolder) {
             visible = false
-            drawHandler.removeCallbacks(drawTask)
-            stopVideoProcessing()
+            stopVideo()
             super.onSurfaceDestroyed(holder)
         }
 
-        private fun loadSelectedMedia() {
-            val selectedVideo = prefs.getString("video_uri", null)
-            if (!selectedVideo.isNullOrBlank()) {
-                if (videoUri != selectedVideo || retriever == null) startVideoProcessing(selectedVideo)
-                return
-            }
-            stopVideoProcessing()
-            loadImage()
-            if (bitmap != null) buildImageDots()
-        }
-
-        private fun loadImage() {
-            val uriString = prefs.getString("image_uri", null)
-            if (uriString == loadedUri) return
-            bitmap?.recycle()
-            bitmap = null
-            dots = emptyList()
-            loadedUri = uriString
-            if (uriString == null) return
-            try {
-                val decoded = contentResolver.openInputStream(Uri.parse(uriString))
-                    ?.use { BitmapFactory.decodeStream(it) } ?: return
-                val maxSide = 1400
-                val scale = minOf(1f, maxSide.toFloat() / maxOf(decoded.width, decoded.height))
-                bitmap = if (scale < 1f) {
-                    Bitmap.createScaledBitmap(
-                        decoded, (decoded.width * scale).toInt().coerceAtLeast(1),
-                        (decoded.height * scale).toInt().coerceAtLeast(1), true
-                    ).also { if (it !== decoded) decoded.recycle() }
-                } else decoded
-            } catch (_: Exception) {
-                bitmap = null
-            }
-        }
-
-        // This grid is created once for the surface. Video frames only replace each dot's colour/brightness.
-        private fun ensureFixedGrid(width: Int, height: Int) {
-            if (width == cachedWidth && height == cachedHeight && gridPositions.isNotEmpty()) return
-            cachedWidth = width
-            cachedHeight = height
-            val spacing = 7f * resources.displayMetrics.density
-            val positions = ArrayList<Pair<Float, Float>>()
+        private fun buildGrid() {
+            if (surfaceWidth <= 0 || surfaceHeight <= 0) return
+            // Wider spacing means fewer draw operations and lower thermal load.
+            val spacing = 10f * resources.displayMetrics.density
+            val points = ArrayList<Pair<Float, Float>>()
             var y = spacing / 2f
-            while (y < height) {
+            while (y < surfaceHeight) {
                 var x = spacing / 2f
-                while (x < width) {
-                    positions.add(x to y)
+                while (x < surfaceWidth) {
+                    points.add(x to y)
                     x += spacing
                 }
                 y += spacing
             }
-            gridPositions = positions
+            grid = points
         }
 
-        private fun buildImageDots() {
-            val image = bitmap ?: return
-            val w = cachedWidth
-            val h = cachedHeight
-            if (w <= 0 || h <= 0) return
-            ensureFixedGrid(w, h)
-            dots = sampleBitmapToDots(image)
+        private fun loadSelectedMedia() {
+            if (!visible || surfaceWidth <= 0 || surfaceHeight <= 0) return
+            val selectedVideo = prefs.getString("video_uri", null)
+            if (!selectedVideo.isNullOrBlank()) {
+                if (videoUri != selectedVideo || retriever == null) startVideo(selectedVideo)
+                return
+            }
+            stopVideo()
+            val selectedImage = prefs.getString("image_uri", null)
+            if (selectedImage != imageUri || dots.isEmpty()) {
+                imageUri = selectedImage
+                dots = emptyList()
+                if (selectedImage != null) {
+                    try {
+                        val bitmap = contentResolver.openInputStream(Uri.parse(selectedImage))
+                            ?.use { BitmapFactory.decodeStream(it) }
+                        if (bitmap != null) {
+                            val scaled = downscale(bitmap, 480)
+                            dots = sample(scaled)
+                            if (scaled !== bitmap) bitmap.recycle()
+                            scaled.recycle()
+                        }
+                    } catch (_: Exception) {
+                        dots = emptyList()
+                    }
+                }
+            }
+            drawCurrentFrame()
         }
 
-        private fun sampleBitmapToDots(source: Bitmap): List<MatrixDot> {
-            val w = cachedWidth
-            val h = cachedHeight
-            if (w <= 0 || h <= 0) return emptyList()
-            val scale = max(w.toFloat() / source.width, h.toFloat() / source.height)
-            val drawnW = source.width * scale
-            val drawnH = source.height * scale
-            val left = (w - drawnW) / 2f
-            val top = (h - drawnH) / 2f
-            val result = ArrayList<MatrixDot>(gridPositions.size)
-            for ((x, y) in gridPositions) {
+        private fun downscale(source: Bitmap, maxWidth: Int): Bitmap {
+            if (source.width <= maxWidth) return source
+            val factor = maxWidth.toFloat() / source.width
+            return Bitmap.createScaledBitmap(
+                source, maxWidth, (source.height * factor).toInt().coerceAtLeast(1), true
+            )
+        }
+
+        private fun sample(source: Bitmap): List<MatrixDot> {
+            if (grid.isEmpty()) return emptyList()
+            val w = source.width
+            val h = source.height
+            val scale = max(surfaceWidth.toFloat() / w, surfaceHeight.toFloat() / h)
+            val left = (surfaceWidth - w * scale) / 2f
+            val top = (surfaceHeight - h * scale) / 2f
+            val pixels = IntArray(w * h)
+            source.getPixels(pixels, 0, w, 0, 0, w, h)
+            val result = ArrayList<MatrixDot>(grid.size)
+            for ((x, y) in grid) {
                 val sx = ((x - left) / scale).toInt()
                 val sy = ((y - top) / scale).toInt()
-                if (sx !in 0 until source.width || sy !in 0 until source.height) {
+                if (sx !in 0 until w || sy !in 0 until h) {
                     result.add(MatrixDot(x, y, 0, 190, 145, 255))
                     continue
                 }
-                val pixel = source.getPixel(sx, sy)
-                val a = Color.alpha(pixel)
-                val r = Color.red(pixel)
-                val g = Color.green(pixel)
-                val b = Color.blue(pixel)
+                val c = pixels[sy * w + sx]
+                val a = Color.alpha(c)
+                val r = Color.red(c)
+                val g = Color.green(c)
+                val b = Color.blue(c)
                 val lum = r * 0.2126f + g * 0.7152f + b * 0.0722f
-                val alpha = if (a <= 30 || lum <= 9f) 0
-                    else ((lum / 255f) * 255f).toInt().coerceIn(0, 255)
+                val alpha = if (a < 24 || lum < 12f) 0 else lum.toInt().coerceIn(0, 255)
                 result.add(MatrixDot(
                     x, y, alpha,
-                    (r * 0.72f + 190 * 0.28f).toInt().coerceIn(0, 255),
+                    (r * 0.70f + 190 * 0.30f).toInt().coerceIn(0, 255),
                     (g * 0.55f + 145 * 0.45f).toInt().coerceIn(0, 255),
                     (b * 0.70f + 255 * 0.30f).toInt().coerceIn(0, 255)
                 ))
@@ -184,123 +153,111 @@ class JarvisWallpaperService : WallpaperService() {
             return result
         }
 
-        private fun startVideoProcessing(uriString: String) {
-            stopVideoProcessing()
+        private fun startVideo(uriString: String) {
+            stopVideo()
             videoUri = uriString
             dots = emptyList()
-            val thread = HandlerThread("JarvisVideoDotDecoder")
+            val thread = HandlerThread("JarvisLowPowerVideo")
             thread.start()
-            videoThread = thread
+            decoderThread = thread
             val worker = Handler(thread.looper)
-            videoHandler = worker
+            decoderHandler = worker
             worker.post {
                 try {
-                    val decoder = MediaMetadataRetriever()
-                    decoder.setDataSource(this@JarvisWallpaperService, Uri.parse(uriString))
-                    val durationMs = decoder.extractMetadata(
-                        MediaMetadataRetriever.METADATA_KEY_DURATION
-                    )?.toLongOrNull() ?: 0L
+                    val r = MediaMetadataRetriever()
+                    r.setDataSource(this@JarvisWallpaperService, Uri.parse(uriString))
+                    val durationMs = r.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                        ?.toLongOrNull() ?: 0L
                     if (durationMs <= 0L) {
-                        decoder.release()
+                        r.release()
                         return@post
                     }
-                    retriever = decoder
-                    videoDurationUs = durationMs * 1000L
-                    videoPositionUs = 0L
-                    decodeNextVideoFrame()
+                    retriever = r
+                    durationUs = durationMs * 1000L
+                    positionUs = 0L
+                    decodeOneFrame()
                 } catch (_: Exception) {
-                    stopVideoProcessing()
+                    main.post { drawCurrentFrame() }
                 }
             }
         }
 
-        // Decode at 8 frames/second off the UI thread. Each frame is sampled onto the exact same grid.
-        private fun decodeNextVideoFrame() {
-            val worker = videoHandler ?: return
-            if (!visible) return
+        // Low-power fallback: 4 sampled frames/second, low-resolution source, no continuous redraw.
+        private fun decodeOneFrame() {
+            val worker = decoderHandler ?: return
+            if (!visible || decoding) return
+            decoding = true
             worker.post {
                 try {
-                    val decoder = retriever ?: return@post
-                    if (videoPositionUs >= videoDurationUs) videoPositionUs = 0L
-                    val frameBitmap = decoder.getFrameAtTime(
-                        videoPositionUs, MediaMetadataRetriever.OPTION_CLOSEST
-                    )
-                    if (frameBitmap != null) {
-                        val scaled = if (frameBitmap.width > 720 || frameBitmap.height > 720) {
-                            val factor = min(720f / frameBitmap.width, 720f / frameBitmap.height)
-                            Bitmap.createScaledBitmap(
-                                frameBitmap,
-                                (frameBitmap.width * factor).toInt().coerceAtLeast(1),
-                                (frameBitmap.height * factor).toInt().coerceAtLeast(1),
-                                true
-                            ).also { if (it !== frameBitmap) frameBitmap.recycle() }
-                        } else frameBitmap
-                        val newDots = sampleBitmapToDots(scaled)
-                        if (scaled !== frameBitmap) scaled.recycle() else frameBitmap.recycle()
-                        if (visible) dots = newDots
+                    val r = retriever ?: return@post
+                    if (positionUs >= durationUs) positionUs = 0L
+                    val frame = r.getFrameAtTime(positionUs, MediaMetadataRetriever.OPTION_CLOSEST)
+                    if (frame != null) {
+                        val small = downscale(frame, 360)
+                        val nextDots = sample(small)
+                        if (small !== frame) frame.recycle()
+                        small.recycle()
+                        main.post {
+                            if (visible) {
+                                dots = nextDots
+                                drawCurrentFrame()
+                            }
+                        }
                     }
-                    videoPositionUs += 125_000L
-                    worker.postDelayed({ decodeNextVideoFrame() }, 125L)
+                    positionUs += 250_000L
                 } catch (_: Exception) {
-                    // Keep the last good frame rather than crashing the wallpaper service.
-                    worker.postDelayed({ decodeNextVideoFrame() }, 250L)
+                    // Keep last good frame.
+                } finally {
+                    decoding = false
+                    if (visible) {
+                        val power = getSystemService(POWER_SERVICE) as android.os.PowerManager
+                        val saver = power.isPowerSaveMode
+                        val thermal = if (android.os.Build.VERSION.SDK_INT >= 29) power.currentThermalStatus else 0
+                        val delay = when {
+                            saver || thermal >= 3 -> 1000L
+                            thermal >= 2 -> 600L
+                            else -> 250L
+                        }
+                        worker.postDelayed({ decodeOneFrame() }, delay)
+                    }
                 }
             }
         }
 
-        private fun stopVideoProcessing() {
-            videoHandler?.removeCallbacksAndMessages(null)
-            videoHandler = null
+        private fun stopVideo() {
+            decoderHandler?.removeCallbacksAndMessages(null)
+            decoderHandler = null
             try { retriever?.release() } catch (_: Exception) {}
             retriever = null
-            videoThread?.quitSafely()
-            videoThread = null
+            decoderThread?.quitSafely()
+            decoderThread = null
             videoUri = null
-            videoDurationUs = 0L
-            videoPositionUs = 0L
+            durationUs = 0L
+            positionUs = 0L
+            decoding = false
         }
 
-        private fun drawFrame() {
-            if (!visible) return
+        private fun drawCurrentFrame() {
+            if (!visible || surfaceWidth <= 0 || surfaceHeight <= 0) return
             val canvas = try { surfaceHolder.lockCanvas() } catch (_: Exception) { null } ?: return
             try {
-                val w = canvas.width
-                val h = canvas.height
                 canvas.drawColor(Color.BLACK)
-                ensureFixedGrid(w, h)
-                if (prefs.getString("video_uri", null).isNullOrBlank() && bitmap == null) {
-                    loadImage()
-                    if (bitmap != null) buildImageDots()
-                }
-                val currentDots = dots
-                if (currentDots.isEmpty()) {
-                    val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                        color = Color.rgb(190, 145, 255)
-                        textAlign = Paint.Align.CENTER
-                        textSize = 15f * resources.displayMetrics.density
-                    }
-                    val message = if (!prefs.getString("video_uri", null).isNullOrBlank())
-                        "PREPARING VIDEO DOT MATRIX" else "SELECT MEDIA IN JARVIS"
-                    canvas.drawText(message, w / 2f, h / 2f, p)
+                val current = dots
+                if (current.isEmpty()) {
+                    paint.color = Color.rgb(190, 145, 255)
+                    paint.textAlign = Paint.Align.CENTER
+                    paint.textSize = 14f * resources.displayMetrics.density
+                    val msg = if (!prefs.getString("video_uri", null).isNullOrBlank())
+                        "LOADING DOT MATRIX VIDEO" else "SELECT MEDIA IN JARVIS"
+                    canvas.drawText(msg, surfaceWidth / 2f, surfaceHeight / 2f, paint)
                 } else {
-                    val saver = (getSystemService(POWER_SERVICE) as PowerManager).isPowerSaveMode
-                    val phase = pulseFrame++ * 0.045f
-                    val radius = 1.45f * resources.displayMetrics.density
-                    val paint = Paint(Paint.ANTI_ALIAS_FLAG)
-                    val glow = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                        maskFilter = BlurMaskFilter(4f * resources.displayMetrics.density, BlurMaskFilter.Blur.NORMAL)
-                    }
-                    for (dot in currentDots) {
-                        val pulse = if (saver) 1f else
-                            0.94f + 0.06f * sin(phase + dot.x * 0.002f + dot.y * 0.001f)
-                        val alpha = (dot.alpha * pulse).toInt().coerceIn(0, 255)
-                        if (alpha <= 0) continue
-                        paint.color = Color.argb(alpha, dot.red, dot.green, dot.blue)
-                        canvas.drawCircle(dot.x, dot.y, radius, paint)
-                        if (!saver && alpha > 175) {
-                            glow.color = Color.argb((alpha * 0.16f).toInt(), dot.red, dot.green, dot.blue)
-                            canvas.drawCircle(dot.x, dot.y, radius, glow)
-                        }
+                    paint.style = Paint.Style.FILL
+                    paint.maskFilter = null
+                    val radius = 1.25f * resources.displayMetrics.density
+                    for (d in current) {
+                        if (d.alpha <= 0) continue
+                        paint.color = Color.argb(d.alpha, d.red, d.green, d.blue)
+                        canvas.drawCircle(d.x, d.y, radius, paint)
                     }
                 }
             } finally {
@@ -310,10 +267,8 @@ class JarvisWallpaperService : WallpaperService() {
 
         override fun onDestroy() {
             visible = false
-            drawHandler.removeCallbacks(drawTask)
-            stopVideoProcessing()
-            bitmap?.recycle()
-            bitmap = null
+            stopVideo()
+            main.removeCallbacksAndMessages(null)
             super.onDestroy()
         }
     }

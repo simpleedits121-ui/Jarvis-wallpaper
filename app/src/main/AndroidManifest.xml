@@ -3,6 +3,8 @@
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
     <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <application
         android:theme="@android:style/Theme.Material.NoActionBar"
         android:label="JARVIS WALLPAPER"
@@ -26,6 +28,18 @@
             android:exported="true">
             <intent-filter><action android:name="android.service.wallpaper.WallpaperService"/></intent-filter>
             <meta-data android:name="android.service.wallpaper" android:resource="@xml/wallpaper"/>
+        </service>
+        <service
+            android:name=".VolumeDotAccessibilityService"
+            android:label="JARVIS Volume Dots"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService"/>
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/volume_accessibility_service"/>
         </service>
     </application>
 </manifest>

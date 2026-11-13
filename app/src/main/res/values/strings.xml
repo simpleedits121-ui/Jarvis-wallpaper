@@ -1,4 +1,4 @@
 <resources>
     <string name="app_name">JARVIS WALLPAPER</string>
-    <string name="wallpaper_description">Animated JARVIS cyberpunk dot matrix and optional video wallpaper</string>
+    <string name="volume_accessibility_description">Shows a temporary animated dot-matrix volume indicator when you press the hardware volume keys. It does not read screen content or user input.</string>
 </resources>
